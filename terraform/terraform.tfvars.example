@@ -1,0 +1,8 @@
+hcloud_token      = ""
+hetznerdns_token  = ""
+ssh_key_name      = "portfolio-deploy-key"
+server_type       = "cx22"
+domain            = "example.com"
+email             = "you@example.com"
+locations         = ["nbg1"]
+monitoring_vm_ip  = "192.0.2.10"

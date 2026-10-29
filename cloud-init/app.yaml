@@ -1,0 +1,147 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - git
+  - docker.io
+  - docker-compose-v2
+  - nginx
+  - certbot
+  - python3-certbot-nginx
+  - prometheus-node-exporter
+
+write_files:
+  - path: /opt/promtail-config.yaml
+    content: |
+      server:
+        http_listen_port: 9080
+        grpc_listen_port: 0
+
+      positions:
+        filename: /tmp/positions.yaml
+
+      clients:
+        - url: http://${monitoring_vm_ip}:3100/loki/api/v1/push
+
+      scrape_configs:
+        - job_name: microsoft_presidio_system
+          static_configs:
+            - targets: ['localhost']
+              labels:
+                host: "{{ .hostname }}"
+                type: "presidio"
+                __path__: /var/log/*.log
+
+        - job_name: microsoft_presidio_docker
+          static_configs:
+            - targets: ['localhost']
+              labels:
+                job: dockerlogs
+                host: "{{ .hostname }}"
+                type: "presidio"
+                __path__: /var/lib/docker/containers/*/*.log
+
+        - job_name: microsoft_presidio_applogs
+          static_configs:
+            - targets: ['localhost']
+              labels:
+                job: applogs
+                host: "{{ .hostname }}"
+                type: "presidio"
+                __path__: /opt/presidio/logs/*.log
+    permissions: "0644"
+
+runcmd:
+  - |
+    cat > /etc/netplan/60-floating-ip.yaml << 'EOF'
+    network:
+        version: 2
+        ethernets:
+            eth0:
+                addresses:
+                - ${floating_ip}/32
+    EOF
+  - netplan apply
+
+  # Clone and start Presidio
+  - git clone https://github.com/data-privacy-stack/presidio.git /opt/presidio
+  - |
+    cat > /opt/presidio/.env <<'EOF'
+    REGISTRY_NAME=local
+    IMAGE_PREFIX=
+    TAG=:latest
+    EOF
+  - cd /opt/presidio && docker compose up -d --build
+
+  # App log directory (for Promtail)
+  - mkdir -p /opt/presidio/logs
+  - chown -R 1000:1000 /opt/presidio/logs
+
+  # Nginx config
+  - |
+    cat > /etc/nginx/sites-available/presidio <<EOF
+    server {
+        listen 80;
+        server_name ${domain};
+
+        location / {
+            proxy_pass http://localhost:5002/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host \$host;
+            proxy_cache_bypass \$http_upgrade;
+        }
+    }
+    EOF
+
+  - ln -s /etc/nginx/sites-available/presidio /etc/nginx/sites-enabled/presidio
+  - rm -f /etc/nginx/sites-enabled/default
+  - nginx -t && systemctl reload nginx
+
+  # Certbot SSL setup (check by open ssl if already ssl includes to avoid ssl issues)
+  - |
+    DOMAIN="${domain}"
+    EMAIL="${email}"
+
+    if [ "$DOMAIN" = "presidio.example.com" ] || [ "$EMAIL" = "you@example.com" ]; then
+      echo "Example domain or email configured; skipping Certbot."
+    elif [ -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]; then
+      echo "SSL already exists locally for $DOMAIN. Skipping Certbot."
+    else
+      echo "[i] No local SSL found. Running certbot..."
+      certbot --nginx --non-interactive --agree-tos -m $EMAIL -d $DOMAIN
+      systemctl reload nginx
+    fi
+
+  # Enable certbot auto-renew every night at 3 AM
+  - echo "0 3 * * * root certbot renew --quiet && systemctl reload nginx" > /etc/cron.d/certbot-renew
+
+  # Start node_exporter
+  - systemctl enable prometheus-node-exporter
+  - systemctl start prometheus-node-exporter
+
+  # Run cadvisor in Docker
+  - |
+    docker run -d \
+      --name=cadvisor \
+      --volume=/:/rootfs:ro \
+      --volume=/var/run:/var/run:ro \
+      --volume=/sys:/sys:ro \
+      --volume=/var/lib/docker/:/var/lib/docker:ro \
+      --publish=8080:8080 \
+      --detach=true \
+      gcr.io/cadvisor/cadvisor:latest
+
+  # Run promtail in Docker
+  - |
+    docker run -d \
+      --name=promtail \
+      -v /opt/promtail-config.yaml:/etc/promtail/config.yaml \
+      -v /var/log:/var/log \
+      -v /var/lib/docker/containers:/var/lib/docker/containers:ro \
+      -v /opt/presidio/logs:/opt/presidio/logs:ro \
+      --user=root \
+      grafana/promtail:2.9.1 \
+      -config.file=/etc/promtail/config.yaml
